@@ -1,74 +1,103 @@
 
 import asyncio
 import http
-import os
 import json
-import urllib.request
-import urllib.error
+import os
+from pathlib import Path
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
+
 from websockets.asyncio.server import serve
 
-WEBHOOK_URL = os.environ.get("https://discord.com/api/webhooks/1564010073452445736/VjxJADgw0NHYuIFgIKGCp3qJTSLXGJFoBfK1S3KL9VZhNHCgkALGk9Vxm-kOQNk_GOd3", "")
-WS_TOKEN = os.environ.get("WS_TOKEN", "")
+BASE_DIR = Path(__file__).parent
+CONFIG_PATH = BASE_DIR / "config.json"
 
 
-async def send_to_discord(message):
-    if not WEBHOOK_URL:
-        print("Webhook Discord non configuré.")
-        return
+def load_config():
+    with CONFIG_PATH.open("r", encoding="utf-8") as file:
+        return json.load(file)
 
-    payload = json.dumps({
-        "content": message[:2000]
-    }).encode("utf-8")
 
-    request = urllib.request.Request(
-        WEBHOOK_URL,
-        data=payload,
+def find_webhook(brainrot, config):
+    for group in config.get("webhooks", {}).values():
+        names = group.get("brainrots", [])
+        if brainrot.casefold() in (name.casefold() for name in names):
+            env_name = group.get("environment_variable", "")
+            return os.environ.get(env_name)
+    return None
+
+
+def send_discord_webhook(url, payload):
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = Request(
+        url,
+        data=body,
         headers={"Content-Type": "application/json"},
-        method="POST"
+        method="POST",
     )
-
-    def send():
-        with urllib.request.urlopen(request, timeout=10) as response:
-            return response.status
-
-    try:
-        status = await asyncio.to_thread(send)
-        print(f"Discord a répondu : {status}")
-    except Exception as error:
-        print(f"Erreur d'envoi Discord : {error}")
+    with urlopen(request, timeout=10) as response:
+        return response.status
 
 
 async def handle(websocket):
-    try:
-        if WS_TOKEN:
-            supplied_token = websocket.request.headers.get(
-                "Authorization", ""
-            )
-            if supplied_token != f"Bearer {WS_TOKEN}":
-                await websocket.close(
-                    code=1008,
-                    reason="Authentification requise"
-                )
-                return
+    expected_token = os.environ.get("WS_TOKEN", "")
+    supplied_token = websocket.request.headers.get("Authorization", "")
 
-        async for message in websocket:
-            print(f"Message reçu : {message[:500]}")
+    if expected_token and supplied_token != f"Bearer {expected_token}":
+        await websocket.close(code=1008, reason="Unauthorized")
+        return
+
+    async for message in websocket:
+        try:
+            event = json.loads(message)
+            brainrot = event.get("brainrot")
+
+            if not isinstance(brainrot, str) or not brainrot.strip():
+                await websocket.send(json.dumps({
+                    "ok": False,
+                    "error": "Missing brainrot field"
+                }))
+                continue
+
+            config = load_config()
+            webhook_url = find_webhook(brainrot.strip(), config)
+
+            if not webhook_url:
+                await websocket.send(json.dumps({
+                    "ok": False,
+                    "error": "No webhook configured for this Brainrot"
+                }))
+                continue
+
+            discord_payload = {
+                "content": f"**Brainrot détecté :** {brainrot[:200]}"
+            }
 
             try:
-                data = json.loads(message)
-                name = data.get("name", "Événement")
-                category = data.get("category", "")
-                text = f"**{name}**"
-                if category:
-                    text += f" — {category}"
-            except (json.JSONDecodeError, AttributeError):
-                text = message
+                await asyncio.to_thread(
+                    send_discord_webhook,
+                    webhook_url,
+                    discord_payload,
+                )
+                await websocket.send(json.dumps({"ok": True}))
+            except (URLError, HTTPError, TimeoutError) as error:
+                print(f"Discord webhook error: {error}")
+                await websocket.send(json.dumps({
+                    "ok": False,
+                    "error": "Discord delivery failed"
+                }))
 
-            await send_to_discord(text)
-            await websocket.send("Événement traité")
-
-    except Exception as error:
-        print(f"Erreur WebSocket : {error}")
+        except json.JSONDecodeError:
+            await websocket.send(json.dumps({
+                "ok": False,
+                "error": "Invalid JSON"
+            }))
+        except Exception as error:
+            print(f"Event processing error: {error}")
+            await websocket.send(json.dumps({
+                "ok": False,
+                "error": "Event processing failed"
+            }))
 
 
 def health_check(connection, request):
@@ -83,7 +112,7 @@ async def main():
         handle,
         "0.0.0.0",
         port,
-        process_request=health_check
+        process_request=health_check,
     ):
         print(f"MiawHub WebSocket lancé sur le port {port}")
         await asyncio.Future()
